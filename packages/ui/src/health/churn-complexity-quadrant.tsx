@@ -7,6 +7,7 @@ import { useMemo, useState } from "react";
 import { bandForScore, formatScore } from "@repowise-dev/types";
 import type { ChurnComplexityPoint } from "@repowise-dev/types/health";
 import { median } from "../lib/math";
+import { ordinal } from "../lib/format";
 import { HEALTH_BAND_FILL } from "./tokens";
 
 export interface ChurnComplexityQuadrantProps {
@@ -141,7 +142,7 @@ export function ChurnComplexityQuadrant({
                 onMouseLeave={() => setHovered(null)}
                 onClick={onSelect ? () => onSelect(p) : undefined}
               >
-                <title>{`${p.file_path}\n${p.commit_count_90d} commits/90d (${Math.round(p.churn_percentile)}th pct) · CCN ${p.max_ccn} · NLOC ${p.nloc} · score ${formatScore(p.score)}`}</title>
+                <title>{`${p.file_path}\n${p.commit_count_90d} commits/90d (${ordinal(Math.round(p.churn_percentile))} pct) · CCN ${p.max_ccn} · NLOC ${p.nloc} · score ${formatScore(p.score)}`}</title>
               </circle>
             );
           })}
