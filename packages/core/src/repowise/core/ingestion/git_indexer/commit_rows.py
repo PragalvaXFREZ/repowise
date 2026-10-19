@@ -81,11 +81,7 @@ def build_commit_rows(
 
     # Lazy import keeps the module-load graph acyclic (change_risk imports
     # git_indexer._constants) and matches the codebase's hot-path import style.
-    from ...analysis.change_risk import (
-        features_from_file_changes,
-        filter_scoring_file_changes,
-        score_change,
-    )
+    from ...analysis.change_risk import features_from_file_changes, score_change
 
     # Author experience: cumulative prior-commit count over THIS batch only.
     # On the full index that batch is the whole window, so the count lands
@@ -94,18 +90,12 @@ def build_commit_rows(
     # the full persisted history (see ``pipeline.incremental``).
     exp_by_sha = author_experience_by_sha(parsed_commits)
 
+    scoring_exclude_patterns = scoring_exclude_patterns or []
     rows: list[dict] = []
     for c in parsed_commits:
         sha = c["sha"]
         subject = (c.get("subject") or "")[:_MAX_SUBJECT_LEN]
-        scoring_exclude_patterns = scoring_exclude_patterns or []
-        raw_changes = c.get("changes") or []
-        if scoring_exclude_patterns:
-            raw_changes = [
-                (row["file_path"], row["lines_added"], row["lines_deleted"])
-                for row in _file_rows_for(sha, raw_changes)
-            ]
-        changes = filter_scoring_file_changes(raw_changes, scoring_exclude_patterns)
+        changes = _scoring_changes_for(c, scoring_exclude_patterns)
         exp = exp_by_sha.get(sha, 0)
         feats = features_from_file_changes(
             changes,
@@ -149,6 +139,20 @@ def build_commit_rows(
             }
         )
     return rows
+
+
+def _scoring_changes_for(commit: dict, exclude_patterns: list[str]) -> list:
+    """Use persisted file-detail semantics only when scoring filters are active."""
+    from ...analysis.change_risk import filter_scoring_file_changes
+
+    changes = commit.get("changes") or []
+    if not exclude_patterns:
+        return changes
+    changes = [
+        (row["file_path"], row["lines_added"], row["lines_deleted"])
+        for row in _file_rows_for(commit["sha"], changes)
+    ]
+    return filter_scoring_file_changes(changes, exclude_patterns)
 
 
 def _file_rows_for(sha: str, changes: list) -> list[dict]:

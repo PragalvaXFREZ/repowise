@@ -27,8 +27,6 @@ async def persist_incremental_commits(
         get_latest_commit_committed_at,
         get_repository,
         update_repo_git_totals,
-        upsert_git_commit_files_bulk,
-        upsert_git_commits_bulk,
     )
     from repowise.core.repo_config import load_repo_config
 
@@ -55,19 +53,7 @@ async def persist_incremental_commits(
         dt = newest if newest.tzinfo is not None else newest.replace(tzinfo=UTC)
         since_ts = int(dt.timestamp())
     with timed(timings, "persist.commits.capture"):
-        # One walk fills both, so they describe the same commit set.
-        file_rows: list[dict] = []
-        rows = await asyncio.to_thread(
-            partial(
-                indexer.capture_new_commit_rows,
-                since_ts=since_ts,
-                file_rows_sink=file_rows,
-            )
-        )
-        if rows:
-            await upsert_git_commits_bulk(session, repo_id, rows)
-        if file_rows:
-            await upsert_git_commit_files_bulk(session, repo_id, file_rows)
+        await _capture_commit_rows(session, repo_id, indexer, since_ts)
     await clear_attribution_if_disabled(session, repo_id)
 
     # What the new commits did to health is scanned by the caller once this
@@ -114,6 +100,25 @@ async def persist_incremental_commits(
 
     with timed(timings, "persist.commits.fix_events"):
         await persist_incremental_fix_events(session, repo_id, indexer)
+
+
+async def _capture_commit_rows(
+    session: Any, repo_id: str, indexer: Any, since_ts: int | None
+) -> None:
+    """Persist scoring rows and complete file details from the same bounded walk."""
+    from repowise.core.persistence.crud import (
+        upsert_git_commit_files_bulk,
+        upsert_git_commits_bulk,
+    )
+
+    file_rows: list[dict] = []
+    rows = await asyncio.to_thread(
+        partial(indexer.capture_new_commit_rows, since_ts=since_ts, file_rows_sink=file_rows)
+    )
+    if rows:
+        await upsert_git_commits_bulk(session, repo_id, rows)
+    if file_rows:
+        await upsert_git_commit_files_bulk(session, repo_id, file_rows)
 
 
 def _churn_prior(repo_row: Any) -> Any:
@@ -272,7 +277,6 @@ def _recompute_commit_experience(
     Emits only changed rows: on a settled index that is a handful, which keeps a
     whole-table read from turning into a whole-table write every update.
     """
-    from repowise.core.analysis.change_risk import change_features_from_stored, score_change
     from repowise.core.ingestion.git_indexer.commit_rows import author_experience_by_sha
 
     exp_by_sha = author_experience_by_sha(
@@ -290,56 +294,73 @@ def _recompute_commit_experience(
         ]
     )
 
+    file_changes = file_changes or {}
     updates: list[dict] = []
-    for r in stored:
-        exp = exp_by_sha.get(r["sha"], 0)
-        feats = change_features_from_stored(
-            la=r["lines_added"],
-            ld=r["lines_deleted"],
-            nf=r["files_changed"],
-            nd=r["dirs_changed"],
-            ns=r["subsystems_changed"],
-            entropy=r["entropy"],
-            exp=exp,
-            is_fix=r["is_fix"],
-            author=r["author_name"],
-            subject=r["subject"],
-            ref=r["sha"],
-            file_changes=(file_changes or {}).get(r["sha"])
-            if scoring_exclude_patterns and file_changes is not None and r["sha"] in file_changes
-            else None,
-            exclude_patterns=scoring_exclude_patterns or (),
+    for row in stored:
+        update = _commit_score_update(
+            row,
+            exp_by_sha.get(row["sha"], 0),
+            file_changes.get(row["sha"]),
+            scoring_exclude_patterns or [],
         )
-        risk = score_change(feats)
-        unchanged = (
-            r["author_experience"] == exp
-            and r["lines_added"] == feats.la
-            and r["lines_deleted"] == feats.ld
-            and r["files_changed"] == feats.nf
-            and r["dirs_changed"] == feats.nd
-            and r["subsystems_changed"] == feats.ns
-            and abs((r["entropy"] or 0.0) - feats.entropy) < 1e-9
-            and r["change_risk_level"] == risk.level
-            and r["change_risk_score"] is not None
-            and abs(r["change_risk_score"] - risk.score) < 1e-9
-        )
-        if unchanged:
-            continue
-        updates.append(
-            {
-                "sha": r["sha"],
-                "author_experience": exp,
-                "lines_added": feats.la,
-                "lines_deleted": feats.ld,
-                "files_changed": feats.nf,
-                "dirs_changed": feats.nd,
-                "subsystems_changed": feats.ns,
-                "entropy": feats.entropy,
-                "change_risk_score": risk.score,
-                "change_risk_level": risk.level,
-            }
-        )
+        if not _commit_score_matches(row, update):
+            updates.append(update)
     return updates
+
+
+def _commit_score_update(
+    row: dict,
+    experience: int,
+    file_changes: list[tuple[str, int, int]] | None,
+    exclude_patterns: list[str],
+) -> dict:
+    """Build one atomic feature-and-score update, retaining stored inputs by default."""
+    from repowise.core.analysis.change_risk import change_features_from_stored, score_change
+
+    feats = change_features_from_stored(
+        la=row["lines_added"],
+        ld=row["lines_deleted"],
+        nf=row["files_changed"],
+        nd=row["dirs_changed"],
+        ns=row["subsystems_changed"],
+        entropy=row["entropy"],
+        exp=experience,
+        is_fix=row["is_fix"],
+        author=row["author_name"],
+        subject=row["subject"],
+        ref=row["sha"],
+        file_changes=file_changes if exclude_patterns else None,
+        exclude_patterns=exclude_patterns,
+    )
+    risk = score_change(feats)
+    return {
+        "sha": row["sha"],
+        "author_experience": experience,
+        "lines_added": feats.la,
+        "lines_deleted": feats.ld,
+        "files_changed": feats.nf,
+        "dirs_changed": feats.nd,
+        "subsystems_changed": feats.ns,
+        "entropy": feats.entropy,
+        "change_risk_score": risk.score,
+        "change_risk_level": risk.level,
+    }
+
+
+def _commit_score_matches(stored: dict, update: dict) -> bool:
+    """Compare persisted scoring fields, allowing roundoff only for float values."""
+    exact_fields = (
+        "author_experience", "lines_added", "lines_deleted", "files_changed",
+        "dirs_changed", "subsystems_changed", "change_risk_level",
+    )
+    if any(stored[field] != update[field] for field in exact_fields):
+        return False
+    if stored["change_risk_score"] is None:
+        return False
+    return (
+        abs((stored["entropy"] or 0.0) - update["entropy"]) < 1e-9
+        and abs(stored["change_risk_score"] - update["change_risk_score"]) < 1e-9
+    )
 
 
 async def persist_incremental_fix_events(session: Any, repo_id: str, indexer: Any) -> None:
