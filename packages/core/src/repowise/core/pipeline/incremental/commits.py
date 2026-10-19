@@ -37,6 +37,7 @@ async def persist_incremental_commits(
         repo_path,
         commit_limit=cfg.get("commit_limit"),
         follow_renames=cfg.get("follow_renames", False),
+        commit_scoring_exclude_patterns=cfg.get("commit_scoring_exclude_patterns"),
         # The fix-event capture walks the tracked-file set itself, so without
         # the repo's excludes an update would store events for files a full
         # index never sees, and they would never age out.
@@ -170,6 +171,7 @@ async def reconcile_commit_experience(session: Any, repo_id: str, indexer: Any) 
         delete_git_commit_files_by_sha,
         delete_git_commits_by_sha,
         get_commit_experience_inputs,
+        get_commit_file_inputs,
         upsert_git_commits_bulk,
     )
 
@@ -189,7 +191,12 @@ async def reconcile_commit_experience(session: Any, repo_id: str, indexer: Any) 
                 stored = [r for r in stored if r["sha"] in reachable]
                 logger.info("commit_orphans_pruned", repo_id=repo_id, count=len(orphans))
 
-        updates = _recompute_commit_experience(stored)
+        file_changes = await get_commit_file_inputs(session, repo_id)
+        updates = _recompute_commit_experience(
+            stored,
+            file_changes=file_changes,
+            scoring_exclude_patterns=getattr(indexer, "commit_scoring_exclude_patterns", []),
+        )
         if updates:
             await upsert_git_commits_bulk(session, repo_id, updates)
             logger.info("commit_experience_reconciled", repo_id=repo_id, count=len(updates))
@@ -253,7 +260,12 @@ def _committed_ts(committed_at: Any) -> float:
     return committed_at.timestamp()
 
 
-def _recompute_commit_experience(stored: list[dict]) -> list[dict]:
+def _recompute_commit_experience(
+    stored: list[dict],
+    *,
+    file_changes: dict[str, list[tuple[str, int, int]]] | None = None,
+    scoring_exclude_patterns: list[str] | None = None,
+) -> list[dict]:
     """Rows whose experience or risk moved, as partial upserts keyed by sha.
 
     Pure, so the ordering and re-scoring can be tested without a database.
@@ -281,23 +293,32 @@ def _recompute_commit_experience(stored: list[dict]) -> list[dict]:
     updates: list[dict] = []
     for r in stored:
         exp = exp_by_sha.get(r["sha"], 0)
-        risk = score_change(
-            change_features_from_stored(
-                la=r["lines_added"],
-                ld=r["lines_deleted"],
-                nf=r["files_changed"],
-                nd=r["dirs_changed"],
-                ns=r["subsystems_changed"],
-                entropy=r["entropy"],
-                exp=exp,
-                is_fix=r["is_fix"],
-                author=r["author_name"],
-                subject=r["subject"],
-                ref=r["sha"],
-            )
+        feats = change_features_from_stored(
+            la=r["lines_added"],
+            ld=r["lines_deleted"],
+            nf=r["files_changed"],
+            nd=r["dirs_changed"],
+            ns=r["subsystems_changed"],
+            entropy=r["entropy"],
+            exp=exp,
+            is_fix=r["is_fix"],
+            author=r["author_name"],
+            subject=r["subject"],
+            ref=r["sha"],
+            file_changes=(file_changes or {}).get(r["sha"])
+            if scoring_exclude_patterns and file_changes is not None and r["sha"] in file_changes
+            else None,
+            exclude_patterns=scoring_exclude_patterns or (),
         )
+        risk = score_change(feats)
         unchanged = (
             r["author_experience"] == exp
+            and r["lines_added"] == feats.la
+            and r["lines_deleted"] == feats.ld
+            and r["files_changed"] == feats.nf
+            and r["dirs_changed"] == feats.nd
+            and r["subsystems_changed"] == feats.ns
+            and abs((r["entropy"] or 0.0) - feats.entropy) < 1e-9
             and r["change_risk_level"] == risk.level
             and r["change_risk_score"] is not None
             and abs(r["change_risk_score"] - risk.score) < 1e-9
@@ -308,6 +329,12 @@ def _recompute_commit_experience(stored: list[dict]) -> list[dict]:
             {
                 "sha": r["sha"],
                 "author_experience": exp,
+                "lines_added": feats.la,
+                "lines_deleted": feats.ld,
+                "files_changed": feats.nf,
+                "dirs_changed": feats.nd,
+                "subsystems_changed": feats.ns,
+                "entropy": feats.entropy,
                 "change_risk_score": risk.score,
                 "change_risk_level": risk.level,
             }

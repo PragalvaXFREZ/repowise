@@ -64,7 +64,9 @@ def author_experience_by_sha(commits: Iterable[Mapping[str, Any]]) -> dict[str, 
     return exp_by_sha
 
 
-def build_commit_rows(parsed_commits: list[dict]) -> list[dict]:
+def build_commit_rows(
+    parsed_commits: list[dict], *, scoring_exclude_patterns: list[str] | None = None
+) -> list[dict]:
     """Build ``git_commits`` row dicts from sunk commit records.
 
     *parsed_commits* is the list populated by ``load_commit_index``'s
@@ -79,7 +81,11 @@ def build_commit_rows(parsed_commits: list[dict]) -> list[dict]:
 
     # Lazy import keeps the module-load graph acyclic (change_risk imports
     # git_indexer._constants) and matches the codebase's hot-path import style.
-    from ...analysis.change_risk import features_from_file_changes, score_change
+    from ...analysis.change_risk import (
+        features_from_file_changes,
+        filter_scoring_file_changes,
+        score_change,
+    )
 
     # Author experience: cumulative prior-commit count over THIS batch only.
     # On the full index that batch is the whole window, so the count lands
@@ -92,7 +98,14 @@ def build_commit_rows(parsed_commits: list[dict]) -> list[dict]:
     for c in parsed_commits:
         sha = c["sha"]
         subject = (c.get("subject") or "")[:_MAX_SUBJECT_LEN]
-        changes = c.get("changes") or []
+        scoring_exclude_patterns = scoring_exclude_patterns or []
+        raw_changes = c.get("changes") or []
+        if scoring_exclude_patterns:
+            raw_changes = [
+                (row["file_path"], row["lines_added"], row["lines_deleted"])
+                for row in _file_rows_for(sha, raw_changes)
+            ]
+        changes = filter_scoring_file_changes(raw_changes, scoring_exclude_patterns)
         exp = exp_by_sha.get(sha, 0)
         feats = features_from_file_changes(
             changes,
